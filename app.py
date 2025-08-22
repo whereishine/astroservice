@@ -60,10 +60,7 @@ def build_preview_text(name: str, results: dict) -> str:
 # ManyChat Instagram send
 # ==============================
 async def send_dm(mc_user_id: str, text: str):
-    """
-    Sendet eine DM via ManyChat *Instagram*-API.
-    Gibt immer ein Dict zurück (auch bei HTML/Fehlern), damit wir sauber debuggen können.
-    """
+    """Send an Instagram DM via ManyChat API. Always returns a dict (also on HTML/errors)."""
     if not MANYCHAT_TOKEN or MANYCHAT_TOKEN == "DEIN_MANYCHAT_API_KEY":
         return {"status": "error", "reason": "MANYCHAT_TOKEN missing or placeholder"}
 
@@ -71,20 +68,21 @@ async def send_dm(mc_user_id: str, text: str):
     headers = {
         "Authorization": f"Bearer {MANYCHAT_TOKEN}",
         "Content-Type": "application/json",
-        "Accept": "application/json",         # JSON anfordern
-        "User-Agent": "astroservice/1.0",     # vermeidet HTML-Fallbacks
+        "Accept": "application/json",
+        "User-Agent": "astroservice/1.0",
     }
     payload = {"subscriber_id": mc_user_id, "message": {"text": text}}
 
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
         resp = await client.post(url, headers=headers, json=payload)
-        body = resp.content.decode(errors="ignore")
+        text_body = resp.text[:800]  # trim for safety
+        content_type = resp.headers.get("content-type", "")
 
     try:
-        data = json.loads(body)               # echtes JSON?
+        data = json.loads(text_body)
     except json.JSONDecodeError:
-        data = {"status": "error", "non_json": True, "status_code": resp.status_code, "body": body[:800]}
-
+        data = {"status": "error", "non_json": True, "status_code": resp.status_code,
+                "content_type": content_type, "body": text_body}
     return data
 
 # ==============================
@@ -107,3 +105,42 @@ async def mc_webhook(lead: Lead, api_key: str = Security(api_key_header)):
     sent = isinstance(mc_resp, dict) and mc_resp.get("status") == "success"
 
     return {"status": "ok", "sent": sent, "preview": preview, "manychat": mc_resp}
+
+# ==============================
+# Debug helpers
+# ==============================
+@app.get("/mc/ping", summary="Check ManyChat token/account JSON")
+async def mc_ping():
+    if not MANYCHAT_TOKEN:
+        raise HTTPException(status_code=500, detail="MANYCHAT_TOKEN missing")
+    url = "https://api.manychat.com/account"
+    headers = {"Authorization": f"Bearer {MANYCHAT_TOKEN}", "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        resp = await client.get(url, headers=headers)
+    text_body = resp.text[:800]
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"non_json": True, "status_code": resp.status_code,
+                "content_type": resp.headers.get("content-type", ""), "body": text_body}
+    return data
+
+@app.get("/mc/test", summary="Send a test DM to subscriber_id")
+async def mc_test(subscriber_id: str):
+    text = "Test aus /mc/test ✅"
+    url = "https://api.manychat.com/instagram/sending/sendMessage"
+    headers = {
+        "Authorization": f"Bearer {MANYCHAT_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "astroservice/1.0",
+    }
+    payload = {"subscriber_id": subscriber_id, "message": {"text": text}}
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+    text_body = resp.text[:800]
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"non_json": True, "status_code": resp.status_code, "body": text_body}
+    return data
