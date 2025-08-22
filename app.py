@@ -1,48 +1,39 @@
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field
-import os, httpx, json
+from pydantic import BaseModel
+import os
 
 # ==========================================
-# Environment Variables
+# Security / Config
 # ==========================================
-MANYCHAT_TOKEN = os.getenv("MANYCHAT_TOKEN", "DEIN_MANYCHAT_API_KEY")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "GEHEIMES_TOKEN")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
-# ==========================================
-# FastAPI app
-# ==========================================
-app = FastAPI(title="Astroservice Webhook", docs_url="/docs", openapi_url="/openapi.json")
+# FastAPI + Swagger
+app = FastAPI(title="Astroservice Webhook (Preview only)", docs_url="/docs", openapi_url="/openapi.json")
 
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "astroservice", "docs": "/docs"}
-
-# Swagger → Authorize: erwartet Header X-Auth-Token
+# Authorize dialog expects this header name
 api_key_header = APIKeyHeader(name="X-Auth-Token", auto_error=False)
 
 # ==========================================
-# Payload
+# Domain
 # ==========================================
+import generate_magic_places
+
 class Lead(BaseModel):
-    mc_user_id: str = Field(..., description="ManyChat Subscriber ID (Instagram)")
+    mc_user_id: str
     first_name: str
     birth_date: str
     birth_time: str
     birth_place: str
 
-# ==========================================
-# Domain logic (deine bestehende Auswertung)
-# ==========================================
-import generate_magic_places
-
 def run_astro_eval(birth_date: str, birth_time: str, birth_place: str):
+    """Delegates to your existing astro logic and returns a dict with keys love/career/health (list[str])."""
     return generate_magic_places.get_magic_places(birth_date, birth_time, birth_place)
 
 def build_preview_text(name: str, results: dict) -> str:
-    love = ", ".join(results.get("love", [])[:3])
-    career = ", ".join(results.get("career", [])[:3])
-    health = ", ".join(results.get("health", [])[:3])
+    love = ", ".join(results.get("love", [])[:3]) or "–"
+    career = ", ".join(results.get("career", [])[:3]) or "–"
+    health = ", ".join(results.get("health", [])[:3]) or "–"
     return (
         f"🎁 Danke {name}! Hier deine Traumorte 🌍✨\n\n"
         f"❤️ Liebe → {love}\n"
@@ -52,71 +43,30 @@ def build_preview_text(name: str, results: dict) -> str:
     )
 
 # ==========================================
-# ManyChat: /fb/sending/sendContent (funktioniert für IG)
+# Routes
 # ==========================================
-MANYCHAT_SEND_URL = "https://api.manychat.com/fb/sending/sendContent"
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "astroservice", "docs": "/docs"}
 
-def _mc_headers():
-    return {
-        "Authorization": f"Bearer {MANYCHAT_TOKEN}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": "astroservice/1.0",
-    }
-
-def _mc_text_payload(subscriber_id: str, text: str) -> dict:
-    # v2 content schema
-    return {
-        "subscriber_id": subscriber_id,
-        "data": {
-            "version": "v2",
-            "content": {
-                "messages": [
-                    {"type": "text", "text": text}
-                ]
-            }
-        }
-    }
-
-async def send_dm(mc_user_id: str, text: str):
-    if not MANYCHAT_TOKEN or MANYCHAT_TOKEN == "DEIN_MANYCHAT_API_KEY":
-        return {"status": "error", "reason": "MANYCHAT_TOKEN missing or placeholder"}
-    payload = _mc_text_payload(mc_user_id, text)
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-        resp = await client.post(MANYCHAT_SEND_URL, headers=_mc_headers(), json=payload)
-        body = resp.text[:1000]
-        ctype = resp.headers.get("content-type","")
-    try:
-        data = resp.json()
-    except Exception:
-        data = {"non_json": True, "status_code": resp.status_code, "content_type": ctype, "body": body}
-    return data
-
-# ==========================================
-# Webhook
-# ==========================================
-@app.post("/mc/webhook", summary="ManyChat Webhook (Instagram)")
-async def mc_webhook(lead: Lead, api_key: str = Security(api_key_header)):
-    # Auth
+@app.post("/mc/webhook", summary="ManyChat Webhook (returns preview only)")
+def mc_webhook(lead: Lead, api_key: str = Security(api_key_header)):
+    # Simple header auth
     if api_key != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # 1) Auswertung
+    # 1) Evaluate
     results = run_astro_eval(lead.birth_date, lead.birth_time, lead.birth_place)
 
-    # 2) Nachricht bauen
+    # 2) Build preview text
     preview = build_preview_text(lead.first_name, results)
 
-    # 3) DM versenden
-    mc_resp = await send_dm(lead.mc_user_id, preview)
-    sent = isinstance(mc_resp, dict) and mc_resp.get("status") == "success"
-
-    return {"status": "ok", "sent": sent, "preview": preview, "manychat": mc_resp}
-
-# ==========================================
-# Debug: manueller Testversand
-# ==========================================
-@app.get("/mc/test", summary="Send test DM using /fb/sending/sendContent")
-async def mc_test(subscriber_id: str):
-    mc_resp = await send_dm(subscriber_id, "Test aus /mc/test ✅")
-    return mc_resp
+    # 3) Return to ManyChat for Response Mapping (no DM send here)
+    return {
+        "status": "ok",
+        "sent": False,              # server sends nothing; ManyChat sends the DM
+        "preview": preview,
+        "love": results.get("love", []),
+        "career": results.get("career", []),
+        "health": results.get("health", []),
+    }
