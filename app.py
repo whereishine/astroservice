@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 import os, httpx, json
 
 # ==============================
-# Environment
+# Environment Variables
 # ==============================
 MANYCHAT_TOKEN = os.getenv("MANYCHAT_TOKEN", "DEIN_MANYCHAT_API_KEY")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "GEHEIMES_TOKEN")
