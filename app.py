@@ -1,102 +1,83 @@
-# app.py
-# Astroservice Webhook (Preview-only sending handled by ManyChat)
-# ---------------------------------------------------------------
-# This service receives lead data from ManyChat, calculates the
-# "Magic Places" preview text, and RETURNS the text in JSON.
-# IMPORTANT: The service does NOT send any DMs itself. ManyChat
-# should send the message in your Flow using the returned value.
-
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, EmailStr
+from typing import Optional
 import os
-from fastapi import FastAPI, HTTPException, Security, Query
-from fastapi.security import APIKeyHeader
-from pydantic import BaseModel
+import smtplib
+from email.mime.text import MIMEText
 
-# ---- Config
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # set in Render -> Environment
+app = FastAPI(title="Where I Shine – Email Webhook")
 
-# ---- FastAPI app
-app = FastAPI(title="Astroservice Webhook", version="0.1.0")
-
-# Expect the secret from ManyChat in header: X-Auth-Token
-api_key_header = APIKeyHeader(name="X-Auth-Token", auto_error=False)
-
-
-# ---- Data models
+# -------- Models --------
 class Lead(BaseModel):
-    mc_user_id: str
-    first_name: str
-    birth_date: str
-    birth_time: str
-    birth_place: str
+    first_name: Optional[str] = ""
+    email: EmailStr
+    birth_date: Optional[str] = ""
+    birth_time: Optional[str] = ""
+    birth_place: Optional[str] = ""
 
+# -------- Helpers --------
+def build_preview(lead: Lead) -> str:
+    """Create the quick preview text that goes into the email.
+    You can customize this freely later (or replace with real scoring)."""
+    lines = [
+        f"🎁 Danke {lead.first_name or 'du'}!",
+        "Hier ist deine schnelle Traumort-Vorschau 🌍✨",
+        "",
+        "❤️ Liebe → Rom · Paris · Barcelona",
+        "🏆 Karriere → Berlin · London · New York",
+        "💚 Wohlbefinden → Lissabon · Bali · Costa Rica",
+        "",
+        "— Deine Angaben —",
+        f"Geburtsdatum: {lead.birth_date or '–'}",
+        f"Geburtszeit:  {lead.birth_time or '–'}",
+        f"Geburtsort:   {lead.birth_place or '–'}",
+    ]
+    return "\n".join(lines)
 
-# ---- Your evaluation logic
-# Make sure generate_magic_places.py is in the same repo
-import generate_magic_places
+def require_env(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
+        raise HTTPException(status_code=500, detail=f"Missing environment variable: {name}")
+    return val
 
-
-def run_astro_eval(birth_date: str, birth_time: str, birth_place: str):
-    """Wrapper around your evaluation logic."""
-    return generate_magic_places.get_magic_places(birth_date, birth_time, birth_place)
-
-
-def build_preview_text(name: str, results: dict) -> str:
-    love = ", ".join(results.get("love", [])[:3])
-    career = ", ".join(results.get("career", [])[:3])
-    health = ", ".join(results.get("health", [])[:3])
-    return (
-        f"🎁 Danke {name}! Hier deine Traumorte 🌍✨\n\n"
-        f"❤️ Liebe → {love}\n"
-        f"🏆 Karriere → {career}\n"
-        f"💚 Gesundheit → {health}\n\n"
-        f"👉 Für deine ausführliche Analyse antworte: PREMIUM"
-    )
-
-
-# ---- Endpoints
+# -------- Routes --------
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "astroservice", "docs": "/docs"}
+    return {"status": "ok", "service": "whereishine-email", "docs": "/docs"}
 
-
-@app.post("/mc/webhook", summary="ManyChat Webhook (Instagram)")
-async def mc_webhook(lead: Lead, api_key: str = Security(api_key_header)):
-    """Receives lead data from ManyChat and returns preview text and top3 lists.
-    This endpoint does NOT send messages. Send them from ManyChat Flow.
-    """
-    if not api_key or api_key != WEBHOOK_SECRET:
+@app.post("/mc/email")
+def send_email(
+    lead: Lead,
+    x_webhook_secret: Optional[str] = Header(None, convert_underscores=False)
+):
+    # Authenticate request
+    webhook_secret = require_env("WEBHOOK_SECRET")
+    if x_webhook_secret != webhook_secret:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # 1) Calculate results
-    results = run_astro_eval(lead.birth_date, lead.birth_time, lead.birth_place)
+    # Build email content
+    preview = build_preview(lead)
+    msg = MIMEText(preview, "plain", "utf-8")
+    from_email = require_env("FROM_EMAIL")
+    from_name = os.getenv("FROM_NAME", "Where I Shine")
+    msg["Subject"] = "Deine Traumort-Auswertung"
+    msg["From"] = f"{from_name} <{from_email}>"
+    msg["To"] = lead.email
 
-    # 2) Build preview text
-    preview = build_preview_text(lead.first_name, results)
+    # SMTP config
+    smtp_host = require_env("SMTP_HOST")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = require_env("SMTP_USER")
+    smtp_pass = require_env("SMTP_PASS")
 
-    # 3) Return data for ManyChat to send
-    return {
-        "status": "ok",
-        "preview": preview,
-        "love_top3": results.get("love", [])[:3],
-        "career_top3": results.get("career", [])[:3],
-        "health_top3": results.get("health", [])[:3],
-    }
+    # Send email via SMTP (STARTTLS on port 587)
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(from_email, [lead.email], msg.as_string())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SMTP error: {e}")
 
-
-@app.get("/mc/test", summary="Test endpoint (no sending here)")
-def mc_test(subscriber_id: str = Query(..., description="ManyChat subscriber id"),
-            text: str = Query("Test", description="Preview text placeholder"),
-            tag: str | None = Query(None, description="Optional message tag placeholder")):
-    """This endpoint is only for quick checks.
-    It never sends DMs; sending is done by ManyChat in the Flow."""
-    return {
-        "status": "ok",
-        "note": "Test-Endpoint – Nachrichten werden von ManyChat gesendet, nicht hier.",
-        "subscriber_id": subscriber_id,
-        "text": text,
-        "tag": tag
-    }
-
-
-# If you run locally:
-# uvicorn app:app --host 0.0.0.0 --port 10000
+    # Response for ManyChat mapping (you can use 'preview' in Response Mapping)
+    return {"status": "ok", "preview": preview}
