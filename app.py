@@ -1,83 +1,95 @@
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, EmailStr
-from typing import Optional
 import os
+from flask import Flask, request, jsonify
 import smtplib
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-app = FastAPI(title="Where I Shine – Email Webhook")
+APP_NAME = "astroservice"
+app = Flask(APP_NAME)
 
-# -------- Models --------
-class Lead(BaseModel):
-    first_name: Optional[str] = ""
-    email: EmailStr
-    birth_date: Optional[str] = ""
-    birth_time: Optional[str] = ""
-    birth_place: Optional[str] = ""
+# Helper: build HTML preview block from list/strings
+def build_preview_html(preview):
+    if isinstance(preview, list):
+        items = "".join(f"<li>{x}</li>" for x in preview)
+        return f"<ul>{items}</ul>"
+    if isinstance(preview, dict):
+        items = "".join(f"<li><b>{k}</b>: {v}</li>" for k, v in preview.items())
+        return f"<ul>{items}</ul>"
+    return f"<p>{preview}</p>"
 
-# -------- Helpers --------
-def build_preview(lead: Lead) -> str:
-    """Create the quick preview text that goes into the email.
-    You can customize this freely later (or replace with real scoring)."""
-    lines = [
-        f"🎁 Danke {lead.first_name or 'du'}!",
-        "Hier ist deine schnelle Traumort-Vorschau 🌍✨",
-        "",
-        "❤️ Liebe → Rom · Paris · Barcelona",
-        "🏆 Karriere → Berlin · London · New York",
-        "💚 Wohlbefinden → Lissabon · Bali · Costa Rica",
-        "",
-        "— Deine Angaben —",
-        f"Geburtsdatum: {lead.birth_date or '–'}",
-        f"Geburtszeit:  {lead.birth_time or '–'}",
-        f"Geburtsort:   {lead.birth_place or '–'}",
-    ]
-    return "\n".join(lines)
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "service": APP_NAME})
 
-def require_env(name: str) -> str:
-    val = os.getenv(name)
-    if not val:
-        raise HTTPException(status_code=500, detail=f"Missing environment variable: {name}")
-    return val
+@app.post("/email/send")
+def email_send():
+    data = request.get_json(silent=True) or {}
+    # required fields
+    to_email = data.get("to_email")
+    first_name = data.get("first_name", "")
+    preview = data.get("preview")
 
-# -------- Routes --------
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "whereishine-email", "docs": "/docs"}
+    if not to_email or preview is None:
+        return jsonify({"detail": "Missing required fields: to_email, preview"}), 422
 
-@app.post("/mc/email")
-def send_email(
-    lead: Lead,
-    x_webhook_secret: Optional[str] = Header(None, convert_underscores=False)
-):
-    # Authenticate request
-    webhook_secret = require_env("WEBHOOK_SECRET")
-    if x_webhook_secret != webhook_secret:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    # Build email content
-    preview = build_preview(lead)
-    msg = MIMEText(preview, "plain", "utf-8")
-    from_email = require_env("FROM_EMAIL")
-    from_name = os.getenv("FROM_NAME", "Where I Shine")
-    msg["Subject"] = "Deine Traumort-Auswertung"
-    msg["From"] = f"{from_name} <{from_email}>"
-    msg["To"] = lead.email
-
-    # SMTP config
-    smtp_host = require_env("SMTP_HOST")
+    # SMTP config from environment
+    smtp_host = os.getenv("SMTP_HOST")
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    smtp_user = require_env("SMTP_USER")
-    smtp_pass = require_env("SMTP_PASS")
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_pass = os.getenv("SMTP_PASS")
+    from_email = os.getenv("FROM_EMAIL") or smtp_user
 
-    # Send email via SMTP (STARTTLS on port 587)
+    if not all([smtp_host, smtp_user, smtp_pass, from_email]):
+        return jsonify({"detail": "SMTP environment not fully configured"}), 500
+
+    subject = "Deine persönlichen Traumorte – Kurzvorschau"
+    # Build body
+    preview_html = build_preview_html(preview)
+    html_body = f"""
+    <html>
+      <body style="font-family: Arial, sans-serif;">
+        <h2>Hallo {first_name or ''} 👋</h2>
+        <p>Hier ist deine kostenlose Kurzvorschau deiner <b>Traumorte</b> anhand deiner Angaben.</p>
+        {preview_html}
+        <hr />
+        <p>Wenn du möchtest, erstelle ich dir gern eine <b>Premium-Auswertung</b> mit Karte,
+        konkreten Handlungstipps & Prioritäten – antworte einfach auf diese E-Mail.</p>
+        <p>Liebe Grüße,<br/>Astroservice</p>
+      </body>
+    </html>
+    """
+    text_body = f"""Hallo {first_name or ''}
+
+Hier ist deine Kurzvorschau deiner Traumorte:
+
+{preview if isinstance(preview, str) else str(preview)}
+
+Für eine Premium-Auswertung (inkl. Karte und Empfehlungen) antworte einfach auf diese E-Mail.
+
+Liebe Grüße
+Astroservice
+"""
+
+    # Compose email
+    msg = MIMEMultipart("alternative")
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    # Send via SMTP (STARTTLS)
     try:
         with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+            server.ehlo()
             server.starttls()
             server.login(smtp_user, smtp_pass)
-            server.sendmail(from_email, [lead.email], msg.as_string())
+            server.sendmail(from_email, [to_email], msg.as_string())
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"SMTP error: {e}")
+        return jsonify({"detail": "SMTP send failed", "error": str(e)}), 500
 
-    # Response for ManyChat mapping (you can use 'preview' in Response Mapping)
-    return {"status": "ok", "preview": preview}
+    return jsonify({"status": "sent", "to": to_email})
+    
+if __name__ == "__main__":
+    # For local debug only; on Railway a WSGI server will be used by default
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
