@@ -1,92 +1,75 @@
-from flask import Flask, request, jsonify
+# app.py  (FastAPI)
+from fastapi import FastAPI
+from pydantic import BaseModel, EmailStr
 import os
-import smtplib
+import smtplib, ssl
 from email.mime.text import MIMEText
-from email.utils import formataddr
 
-app = Flask(__name__)
+app = FastAPI(title="Astroservice", version="1.0")
 
-# --- kleine Health- und Info-Endpoints ---
-@app.get("/status")
-def status():
-    return jsonify({"status": "ok", "service": "astroservice", "docs": "/docs"})
+class Intake(BaseModel):
+    mc_user_id: str | None = None
+    first_name: str
+    email: EmailStr | None = None
+    birth_date: str
+    birth_time: str
+    birth_place: str
 
-@app.get("/docs")
-def docs():
-    return jsonify({
-        "POST /email/send": {
-            "headers": {"Content-Type": "application/json", "X-Auth-Token": "<SEND_KEY> (optional, s.u.)"},
-            "body": {
-                "first_name": "Max",
-                "email": "kunde@example.com",
-                "birth_date": "TT.MM.JJJJ",
-                "birth_time": "HH:MM",
-                "birth_place": "Ort"
-            }
-        }
-    })
+def build_preview(d: Intake) -> str:
+    # Hier nur eine einfache Vorschau – später ersetzen wir das
+    lines = [
+        f"Hi {d.first_name},",
+        "",
+        "Deine Traumort-Vorschau:",
+        f"• Geburtsdatum: {d.birth_date}",
+        f"• Geburtszeit:  {d.birth_time}",
+        f"• Geburtsort:   {d.birth_place}",
+        "",
+        "Für die ausführliche Analyse: PREMIUM.",
+    ]
+    return "\n".join(lines)
 
-# --- Mail-Helfer ---
-def send_mail(to_email: str, subject: str, body: str):
+def try_send_email(to_addr: str, subject: str, body: str) -> bool:
     host = os.getenv("SMTP_HOST")
-    port = int(os.getenv("SMTP_PORT", "587"))
     user = os.getenv("SMTP_USER")
-    pwd  = os.getenv("SMTP_PASS")
-    from_email = os.getenv("SMTP_FROM", user or "no-reply@example.com")
-    from_name  = os.getenv("SMTP_FROM_NAME", "Astroservice")
+    pw   = os.getenv("SMTP_PASS")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    from_addr = os.getenv("MAIL_FROM", "Shine <no-reply@whereishine.com>")
 
-    msg = MIMEText(body, "plain", "utf-8")
+    if not (host and user and pw and to_addr):
+        return False
+
+    msg = MIMEText(body, _charset="utf-8")
     msg["Subject"] = subject
-    msg["From"] = formataddr((from_name, from_email))
-    msg["To"] = to_email
+    msg["From"] = from_addr
+    msg["To"] = to_addr
 
+    context = ssl.create_default_context()
     with smtplib.SMTP(host, port) as server:
-        server.starttls()
-        if user and pwd:
-            server.login(user, pwd)
-        server.send_message(msg)
+        server.starttls(context=context)
+        server.login(user, pw)
+        server.sendmail(from_addr, [to_addr], msg.as_string())
+    return True
 
-# --- Endpoint: E-Mail senden ---
-@app.post("/email/send")
-def email_send():
-    # optionales Token (X-Auth-Token) prüfen, falls gesetzt
-    required_token = os.getenv("SEND_KEY")
-    got_token = request.headers.get("X-Auth-Token")
-    if required_token:
-        if not got_token or got_token != required_token:
-            return jsonify({"detail": "Unauthorized"}), 401
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "astroservice", "docs": "/docs"}
 
-    data = request.get_json(silent=True) or {}
-    first_name = data.get("first_name", "").strip()
-    email      = data.get("email", "").strip()
-    bdate      = data.get("birth_date", "").strip()
-    btime      = data.get("birth_time", "").strip()
-    bplace     = data.get("birth_place", "").strip()
-
-    if not email:
-        return jsonify({"detail": "Email is required"}), 422
-
-    # einfacher Preview-Text (Platzhalter)
-    preview = (
-        f"Hey {first_name or 'du'},\n\n"
-        f"deine Traumort‑Daten sind angekommen:\n"
-        f"• Geburtsdatum: {bdate}\n"
-        f"• Geburtszeit:  {btime}\n"
-        f"• Geburtsort:   {bplace}\n\n"
-        "Deine persönliche Auswertung folgt in Kürze. 🙌"
-    )
-
-    try:
-        send_mail(
-            to_email=email,
-            subject="Deine Traumort‑Auswertung (Eingangsbestätigung)",
-            body=preview
+@app.post("/mc/email-intake")
+def email_intake(data: Intake):
+    preview = build_preview(data)
+    sent = False
+    if data.email:
+        sent = try_send_email(
+            data.email,
+            "Deine Traumort‑Vorschau",
+            preview
         )
-    except Exception as e:
-        return jsonify({"detail": "Mail send failed", "error": str(e)}), 500
+    return {"status": "ok", "sent_email": sent, "preview": preview}
 
-    return jsonify({"status": "ok", "preview": preview})
-    
-if __name__ == "__main__":
-    # lokaler Start (Railway nutzt gunicorn s. Procfile)
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+# optionaler GET-Test (z.B. im Browser)
+@app.get("/mail/test")
+def mail_test(to: EmailStr):
+    body = "Testmail von Astroservice."
+    sent = try_send_email(str(to), "Astroservice Test", body)
+    return {"status": "ok" if sent else "skip", "to": to}
