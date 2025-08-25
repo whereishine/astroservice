@@ -1,95 +1,92 @@
-import os
 from flask import Flask, request, jsonify
+import os
 import smtplib
-from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formataddr
 
-APP_NAME = "astroservice"
-app = Flask(APP_NAME)
+app = Flask(__name__)
 
-# Helper: build HTML preview block from list/strings
-def build_preview_html(preview):
-    if isinstance(preview, list):
-        items = "".join(f"<li>{x}</li>" for x in preview)
-        return f"<ul>{items}</ul>"
-    if isinstance(preview, dict):
-        items = "".join(f"<li><b>{k}</b>: {v}</li>" for k, v in preview.items())
-        return f"<ul>{items}</ul>"
-    return f"<p>{preview}</p>"
+# --- kleine Health- und Info-Endpoints ---
+@app.get("/status")
+def status():
+    return jsonify({"status": "ok", "service": "astroservice", "docs": "/docs"})
 
-@app.get("/health")
-def health():
-    return jsonify({"status": "ok", "service": APP_NAME})
+@app.get("/docs")
+def docs():
+    return jsonify({
+        "POST /email/send": {
+            "headers": {"Content-Type": "application/json", "X-Auth-Token": "<SEND_KEY> (optional, s.u.)"},
+            "body": {
+                "first_name": "Max",
+                "email": "kunde@example.com",
+                "birth_date": "TT.MM.JJJJ",
+                "birth_time": "HH:MM",
+                "birth_place": "Ort"
+            }
+        }
+    })
 
+# --- Mail-Helfer ---
+def send_mail(to_email: str, subject: str, body: str):
+    host = os.getenv("SMTP_HOST")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user = os.getenv("SMTP_USER")
+    pwd  = os.getenv("SMTP_PASS")
+    from_email = os.getenv("SMTP_FROM", user or "no-reply@example.com")
+    from_name  = os.getenv("SMTP_FROM_NAME", "Astroservice")
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = formataddr((from_name, from_email))
+    msg["To"] = to_email
+
+    with smtplib.SMTP(host, port) as server:
+        server.starttls()
+        if user and pwd:
+            server.login(user, pwd)
+        server.send_message(msg)
+
+# --- Endpoint: E-Mail senden ---
 @app.post("/email/send")
 def email_send():
+    # optionales Token (X-Auth-Token) prüfen, falls gesetzt
+    required_token = os.getenv("SEND_KEY")
+    got_token = request.headers.get("X-Auth-Token")
+    if required_token:
+        if not got_token or got_token != required_token:
+            return jsonify({"detail": "Unauthorized"}), 401
+
     data = request.get_json(silent=True) or {}
-    # required fields
-    to_email = data.get("to_email")
-    first_name = data.get("first_name", "")
-    preview = data.get("preview")
+    first_name = data.get("first_name", "").strip()
+    email      = data.get("email", "").strip()
+    bdate      = data.get("birth_date", "").strip()
+    btime      = data.get("birth_time", "").strip()
+    bplace     = data.get("birth_place", "").strip()
 
-    if not to_email or preview is None:
-        return jsonify({"detail": "Missing required fields: to_email, preview"}), 422
+    if not email:
+        return jsonify({"detail": "Email is required"}), 422
 
-    # SMTP config from environment
-    smtp_host = os.getenv("SMTP_HOST")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_pass = os.getenv("SMTP_PASS")
-    from_email = os.getenv("FROM_EMAIL") or smtp_user
+    # einfacher Preview-Text (Platzhalter)
+    preview = (
+        f"Hey {first_name or 'du'},\n\n"
+        f"deine Traumort‑Daten sind angekommen:\n"
+        f"• Geburtsdatum: {bdate}\n"
+        f"• Geburtszeit:  {btime}\n"
+        f"• Geburtsort:   {bplace}\n\n"
+        "Deine persönliche Auswertung folgt in Kürze. 🙌"
+    )
 
-    if not all([smtp_host, smtp_user, smtp_pass, from_email]):
-        return jsonify({"detail": "SMTP environment not fully configured"}), 500
-
-    subject = "Deine persönlichen Traumorte – Kurzvorschau"
-    # Build body
-    preview_html = build_preview_html(preview)
-    html_body = f"""
-    <html>
-      <body style="font-family: Arial, sans-serif;">
-        <h2>Hallo {first_name or ''} 👋</h2>
-        <p>Hier ist deine kostenlose Kurzvorschau deiner <b>Traumorte</b> anhand deiner Angaben.</p>
-        {preview_html}
-        <hr />
-        <p>Wenn du möchtest, erstelle ich dir gern eine <b>Premium-Auswertung</b> mit Karte,
-        konkreten Handlungstipps & Prioritäten – antworte einfach auf diese E-Mail.</p>
-        <p>Liebe Grüße,<br/>Astroservice</p>
-      </body>
-    </html>
-    """
-    text_body = f"""Hallo {first_name or ''}
-
-Hier ist deine Kurzvorschau deiner Traumorte:
-
-{preview if isinstance(preview, str) else str(preview)}
-
-Für eine Premium-Auswertung (inkl. Karte und Empfehlungen) antworte einfach auf diese E-Mail.
-
-Liebe Grüße
-Astroservice
-"""
-
-    # Compose email
-    msg = MIMEMultipart("alternative")
-    msg["From"] = from_email
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.attach(MIMEText(text_body, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-    # Send via SMTP (STARTTLS)
     try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(from_email, [to_email], msg.as_string())
+        send_mail(
+            to_email=email,
+            subject="Deine Traumort‑Auswertung (Eingangsbestätigung)",
+            body=preview
+        )
     except Exception as e:
-        return jsonify({"detail": "SMTP send failed", "error": str(e)}), 500
+        return jsonify({"detail": "Mail send failed", "error": str(e)}), 500
 
-    return jsonify({"status": "sent", "to": to_email})
+    return jsonify({"status": "ok", "preview": preview})
     
 if __name__ == "__main__":
-    # For local debug only; on Railway a WSGI server will be used by default
+    # lokaler Start (Railway nutzt gunicorn s. Procfile)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
